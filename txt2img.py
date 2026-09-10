@@ -18,7 +18,8 @@ dirpath = os.path.dirname(os.path.abspath(__file__)) + "/" #実行ファイル�
 text = args[1] #メッセージを設定
 
 im_fnt = ImageFont.truetype(dirpath + fontfile, 10) #ImageFontインスタンスを作る
-w, h = im_fnt.getsize(text) #文字列の縦横を取得
+bbox = im_fnt.getbbox(text) #文字列の描画範囲を取得
+w = bbox[2] - bbox[0]
 im = Image.new("1",(w,11),"black") #Imageインスタンスを作る。高さは11px固定
 draw = ImageDraw.Draw(im) #im上のImageDrawインスタンスを作る
 draw.text((0,1),text, fill="white", font=im_fnt) #1px分、下にシフトして書き込む
