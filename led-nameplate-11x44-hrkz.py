@@ -5,7 +5,7 @@
 # based on code by (C) 2019 juergen@fabmail.org
 # v0.10, 2019-09-09, jw Support for loading monochrome images. Typos fixed.
 
-import sys, os, re, time, argparse
+import sys, os, re, time, argparse, subprocess
 from datetime import datetime
 from array import array
 try:
@@ -242,11 +242,11 @@ def bitmap_img(file):
   from PIL import Image
 
   im = Image.open(file)
-  print("fetching bitmap from file %s -> (%d x %d)" % (file, im.width, im.height))
   if im.height != 11:
     sys.exit("%s: image height must be 11px. Seen %d" % (file, im.height))
   buf = array('B')
   cols = int((im.width+7)/8)
+  print("DEBUG image file=%s width=%d height=%d cols=%d" % (file, im.width, im.height, cols), file=sys.stderr)
   for col in range(cols):
     for row in range(11):       # [0..10]
       byte_val = 0
@@ -341,6 +341,9 @@ parser.add_argument('-B', '--brightness', default='100', help="Brightness for th
 parser.add_argument('-m', '--mode',  default='0', help="Up to 8 mode values: Scroll-left(0) -right(1) -up(2) -down(3); still-centered(4); animation(5); drop-down(6); curtain(7); laser(8); See '--mode-help' for more details.")
 parser.add_argument('-b', '--blink', default='0', help="1: blinking, 0: normal. Up to 8 comma-separated values")
 parser.add_argument('-a', '--ants',  default='0', help="1: animated border, 0: normal. Up to 8 comma-separated values")
+parser.add_argument('--write-delay', type=float, default=0.1, help="Delay before each PyUSB packet write in seconds.")
+parser.add_argument('--write-timeout', type=int, default=5000, help="PyUSB packet write timeout in milliseconds.")
+parser.add_argument('--debug-usb', action='store_true', help="Print USB state diagnostics to stderr before and after packet writes.")
 parser.add_argument('-p', '--preload',  metavar='FILE', action='append', help=argparse.SUPPRESS)       # "Load bitmap images. Use ^A, ^B, ^C, ... in text messages to make them visible. Deprecated, embed within ':' instead")
 parser.add_argument('-l', '--list-names', action='version', help="list named icons to be embedded in messages and exit", version=':'+':  :'.join(bitmap_named.keys())+':  ::  or e.g. :path/to/some_icon.png:')
 parser.add_argument('message', metavar='MESSAGE', nargs='+', help="Up to 8 message texts with embedded builtin icons or loaded images within colons(:) -- See -l for a list of builtins")
@@ -366,6 +369,49 @@ parser.add_argument('--mode-help', action='version', help=argparse.SUPPRESS, ver
  (No "rotation" or "smoothing"(?) effect can be expected, though)
 """ % sys.argv[0])
 args = parser.parse_args()
+
+def debug_usb_state(stage):
+  if not args.debug_usb:
+    return
+  print("DEBUG usb-state stage=%s" % stage, file=sys.stderr)
+  if have_pyhidapi:
+    print("DEBUG usb-state backend=pyhidapi", file=sys.stderr)
+    return
+  try:
+    found = usb.core.find(idVendor=0x0416, idProduct=0x5020)
+  except Exception as e:
+    print("DEBUG usb-state find_error=%r" % e, file=sys.stderr)
+    return
+  if found is None:
+    print("DEBUG usb-state found=no", file=sys.stderr)
+    return
+  print("DEBUG usb-state found=yes bus=%s address=%s" % (getattr(found, 'bus', None), getattr(found, 'address', None)), file=sys.stderr)
+  try:
+    for cfg in found:
+      for intf in cfg:
+        endpoints = []
+        for ep in intf:
+          endpoints.append("0x%02x" % ep.bEndpointAddress)
+        print("DEBUG usb-state interface=%d endpoints=%s" % (intf.bInterfaceNumber, ",".join(endpoints)), file=sys.stderr)
+  except Exception as e:
+    print("DEBUG usb-state descriptor_error=%r" % e, file=sys.stderr)
+
+def debug_dmesg_tail(lines=40):
+  if not args.debug_usb:
+    return
+  try:
+    result = subprocess.run(["dmesg", "--ctime", "--color=never"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+  except Exception as e:
+    print("DEBUG dmesg error=%r" % e, file=sys.stderr)
+    return
+  if result.returncode != 0:
+    print("DEBUG dmesg returncode=%d stderr=%s" % (result.returncode, result.stderr.strip()), file=sys.stderr)
+    return
+  print("DEBUG dmesg tail begin", file=sys.stderr)
+  for line in result.stdout.splitlines()[-lines:]:
+    print("DEBUG dmesg %s" % line, file=sys.stderr)
+  print("DEBUG dmesg tail end", file=sys.stderr)
+
 if have_pyhidapi:
   devinfo = pyhidapi.hid_enumerate(0x0416, 0x5020)
   #dev = pyhidapi.hid_open(0x0416, 0x5020)
@@ -433,11 +479,33 @@ if len(buf) > 8192:
   sys.exit(1)
 
 if have_pyhidapi:
+  print("DEBUG hidapi write total_bytes=%d" % len(buf), file=sys.stderr)
   pyhidapi.hid_write(dev, buf)
 else:
-  for i in range(int(len(buf)/64)):
-    time.sleep(0.1)
-    dev.write(0x02, buf[i*64:i*64+64])
+  write_delay = args.write_delay
+  write_timeout = args.write_timeout
+  packet_count = int(len(buf)/64)
+  print("DEBUG pyusb write total_bytes=%d packets=%d endpoint=0x02 delay=%.1fs timeout=%dms" % (len(buf), packet_count, write_delay, write_timeout), file=sys.stderr)
+  debug_usb_state("before-write")
+  for i in range(packet_count):
+    chunk = buf[i*64:i*64+64]
+    print("DEBUG write packet=%d/%d len=%d head=%s" % (
+      i+1,
+      packet_count,
+      len(chunk),
+      " ".join("%02x" % x for x in chunk[:16])
+    ), file=sys.stderr)
+    debug_usb_state("before-packet-%d" % (i+1))
+    time.sleep(write_delay)
+    try:
+      written = dev.write(0x02, chunk, timeout=write_timeout)
+    except Exception as e:
+      print("DEBUG write failed packet=%d/%d exception=%r" % (i+1, packet_count, e), file=sys.stderr)
+      debug_usb_state("after-write-error")
+      debug_dmesg_tail()
+      raise
+    print("DEBUG wrote packet=%d/%d result=%s" % (i+1, packet_count, written), file=sys.stderr)
+    debug_usb_state("after-packet-%d" % (i+1))
 
 if have_pyhidapi:
   pyhidapi.hid_close(dev)
