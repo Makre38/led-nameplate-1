@@ -8,31 +8,44 @@
 import sys, os, re, time, argparse, subprocess
 from datetime import datetime
 from array import array
+have_pyhidapi = False
+have_hidapi = False
+have_pyusb = False
 try:
   if sys.version_info[0] < 3: raise Exception("prefer usb.core with python-2.x because of https://github.com/jnweiger/led-badge-ls32/issues/9")
   import pyhidapi
   pyhidapi.hid_init()
   have_pyhidapi = True
 except:
-  have_pyhidapi = False
-  try:
-    import usb.core
-  except:
-    print("ERROR: Need the pyhidapi or usb.core module.")
-    if sys.platform == "darwin":
-      print("""Please try
+  pass
+try:
+  import hid
+  have_hidapi = True
+except:
+  pass
+try:
+  import usb.core
+  import usb.util
+  have_pyusb = True
+except:
+  pass
+
+if not have_pyhidapi and not have_hidapi and not have_pyusb:
+  print("ERROR: Need the pyhidapi, hid, or usb.core module.")
+  if sys.platform == "darwin":
+    print("""Please try
   pip install pyhidapi
   brew install hidapi""")
-    elif sys.platform == "linux":
-      print("""Please try
+  elif sys.platform == "linux":
+    print("""Please try
   sudo pip install pyhidapi
   sudo apt-get install libhidapi-hidraw0
   sudo ln -s /usr/lib/x86_64-linux-gnu/libhidapi-hidraw.so.0  /usr/local/lib/
 or
   sudo apt-get install python3-usb""")
-    else:       # windows?
-      print("""Please with Linux or MacOS or help us implement support for """ + sys.platform)
-    sys.exit(1)
+  else:       # windows?
+    print("""Please with Linux or MacOS or help us implement support for """ + sys.platform)
+  sys.exit(1)
 
 
 __version = "0.10h"
@@ -341,6 +354,7 @@ parser.add_argument('-B', '--brightness', default='100', help="Brightness for th
 parser.add_argument('-m', '--mode',  default='0', help="Up to 8 mode values: Scroll-left(0) -right(1) -up(2) -down(3); still-centered(4); animation(5); drop-down(6); curtain(7); laser(8); See '--mode-help' for more details.")
 parser.add_argument('-b', '--blink', default='0', help="1: blinking, 0: normal. Up to 8 comma-separated values")
 parser.add_argument('-a', '--ants',  default='0', help="1: animated border, 0: normal. Up to 8 comma-separated values")
+parser.add_argument('--usb-backend', choices=('auto', 'pyusb', 'hidapi', 'pyhidapi'), default='auto', help="USB backend to use. 'hidapi' selects Arch python-hidapi's hid module.")
 parser.add_argument('--write-delay', type=float, default=0.1, help="Delay before each PyUSB packet write in seconds.")
 parser.add_argument('--write-timeout', type=int, default=5000, help="PyUSB packet write timeout in milliseconds.")
 parser.add_argument('--debug-usb', action='store_true', help="Print USB state diagnostics to stderr before and after packet writes.")
@@ -370,12 +384,48 @@ parser.add_argument('--mode-help', action='version', help=argparse.SUPPRESS, ver
 """ % sys.argv[0])
 args = parser.parse_args()
 
+use_pyhidapi = False
+use_hidapi = False
+use_pyusb = False
+if args.usb_backend == 'pyhidapi':
+  use_pyhidapi = have_pyhidapi
+elif args.usb_backend == 'hidapi':
+  use_hidapi = have_hidapi
+elif args.usb_backend == 'pyusb':
+  use_pyusb = have_pyusb
+elif have_pyhidapi:
+  use_pyhidapi = True
+elif have_hidapi:
+  use_hidapi = True
+elif have_pyusb:
+  use_pyusb = True
+
+if not use_pyhidapi and not use_hidapi and not use_pyusb:
+  print("ERROR: Requested USB backend '%s' is not available." % args.usb_backend)
+  print("Available backends: pyhidapi=%s hidapi=%s pyusb=%s" % (have_pyhidapi, have_hidapi, have_pyusb))
+  sys.exit(1)
+
 def debug_usb_state(stage):
   if not args.debug_usb:
     return
   print("DEBUG usb-state stage=%s" % stage, file=sys.stderr)
-  if have_pyhidapi:
+  if use_pyhidapi:
     print("DEBUG usb-state backend=pyhidapi", file=sys.stderr)
+    return
+  if use_hidapi:
+    try:
+      devices = hid.enumerate(0x0416, 0x5020)
+    except Exception as e:
+      print("DEBUG usb-state hid_enumerate_error=%r" % e, file=sys.stderr)
+      return
+    print("DEBUG usb-state hidapi found=%d" % len(devices), file=sys.stderr)
+    for info in devices:
+      print("DEBUG usb-state hidapi path=%r interface=%s usage_page=%s usage=%s" % (
+        info.get('path'),
+        info.get('interface_number'),
+        info.get('usage_page'),
+        info.get('usage')
+      ), file=sys.stderr)
     return
   try:
     found = usb.core.find(idVendor=0x0416, idProduct=0x5020)
@@ -412,16 +462,26 @@ def debug_dmesg_tail(lines=40):
     print("DEBUG dmesg %s" % line, file=sys.stderr)
   print("DEBUG dmesg tail end", file=sys.stderr)
 
-if have_pyhidapi:
+if use_pyhidapi:
   devinfo = pyhidapi.hid_enumerate(0x0416, 0x5020)
   #dev = pyhidapi.hid_open(0x0416, 0x5020)
+elif use_hidapi:
+  devinfo = hid.enumerate(0x0416, 0x5020)
 else:
   dev = usb.core.find(idVendor=0x0416, idProduct=0x5020)
 
-if have_pyhidapi:
+if use_pyhidapi:
   if devinfo:
     dev = pyhidapi.hid_open_path(devinfo[0].path)
     print("using [%s %s] int=%d page=%s via pyHIDAPI" % (devinfo[0].manufacturer_string, devinfo[0].product_string, devinfo[0].interface_number, devinfo[0].usage_page))
+  else:
+    print("No led tag with vendorID 0x0416 and productID 0x5020 found.")
+    print("Connect the led tag and run this tool as root.")
+    sys.exit(1)
+elif use_hidapi:
+  if devinfo:
+    dev = hid.Device(path=devinfo[0]['path'])
+    print("using [%s %s] int=%s page=%s via hidapi" % (devinfo[0].get('manufacturer_string'), devinfo[0].get('product_string'), devinfo[0].get('interface_number'), devinfo[0].get('usage_page')))
   else:
     print("No led tag with vendorID 0x0416 and productID 0x5020 found.")
     print("Connect the led tag and run this tool as root.")
@@ -478,9 +538,36 @@ if len(buf) > 8192:
   print ("Writing more than 8192 bytes damages the display!")
   sys.exit(1)
 
-if have_pyhidapi:
+if use_pyhidapi:
   print("DEBUG hidapi write total_bytes=%d" % len(buf), file=sys.stderr)
   pyhidapi.hid_write(dev, buf)
+elif use_hidapi:
+  write_delay = args.write_delay
+  write_timeout = args.write_timeout
+  packet_count = int(len(buf)/64)
+  print("DEBUG hidapi write total_bytes=%d packets=%d report_id=0x00 delay=%.1fs timeout=%dms" % (len(buf), packet_count, write_delay, write_timeout), file=sys.stderr)
+  debug_usb_state("before-write")
+  for i in range(packet_count):
+    chunk = buf[i*64:i*64+64]
+    report = bytes([0]) + bytes(chunk)
+    print("DEBUG write packet=%d/%d payload_len=%d report_len=%d head=%s" % (
+      i+1,
+      packet_count,
+      len(chunk),
+      len(report),
+      " ".join("%02x" % x for x in chunk[:16])
+    ), file=sys.stderr)
+    debug_usb_state("before-packet-%d" % (i+1))
+    time.sleep(write_delay)
+    try:
+      written = dev.write(report)
+    except Exception as e:
+      print("DEBUG write failed packet=%d/%d exception=%r" % (i+1, packet_count, e), file=sys.stderr)
+      debug_usb_state("after-write-error")
+      debug_dmesg_tail()
+      raise
+    print("DEBUG wrote packet=%d/%d result=%s" % (i+1, packet_count, written), file=sys.stderr)
+    debug_usb_state("after-packet-%d" % (i+1))
 else:
   write_delay = args.write_delay
   write_timeout = args.write_timeout
@@ -507,5 +594,7 @@ else:
     print("DEBUG wrote packet=%d/%d result=%s" % (i+1, packet_count, written), file=sys.stderr)
     debug_usb_state("after-packet-%d" % (i+1))
 
-if have_pyhidapi:
+if use_pyhidapi:
   pyhidapi.hid_close(dev)
+elif use_hidapi:
+  dev.close()
